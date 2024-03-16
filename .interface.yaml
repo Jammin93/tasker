@@ -1,0 +1,53 @@
+help_messages:
+  priority: An integer value (1-10) where 10 is the highest priority.
+  difficulty: An integer value (1-10) where 10 is the highest difficulty.
+  time-estimate: |-
+    An integer value representing the estimated time (in hours) needed to complete the task.
+    Supports the following unit modifiers:
+        {m|M}: minute
+        {h|H}: hour
+        {d|D}: day
+        {w|W}: week
+  verbose: Make output more detailed for supported commands and options.
+  desc: A brief description of the task.
+  progress: Percentage of task completion as an integer value.
+  deadline: |-
+    The deadline by which the task must be completed.
+    Format: YYYY-MM-DD[Thh:mm:ss]
+        Y: year (as a four digit integer)
+        M: month
+        D: day
+        h: hour
+        m: minute
+        s: second
+  task_id: The ID of the task (an integer value).
+  type: |- 
+    List all tasks of a given type.
+        type={all | open | closed}
+  reverse: Display the items in reverse order.
+  order_by: |-
+    Order the items by category.
+        order-by={rank | ctime | deadline}
+  tail: Display (at most) the last N-items. Default=5
+  head: Display (at most) the first N-items. Default=5
+errors:
+  # All error messages are formatted with percent-formatting and always expect a value and an option name, in that order.
+  error_prefix: &error_prefix "ERROR: invalid argument '%s' supplied to %s. "
+  time_in_hours: !join
+    - *error_prefix
+    - |- 
+      Must be a valid integer value trailed by an optional unit modifier:
+          {m|M}: Minute
+          {h|H}: Hour
+          {d|D}: Day
+          {w|W}: Week
+  to_datetime: !join
+    - *error_prefix
+    - "Time strings must be supplied in the following format: YYYY-MM-DD[Thh:mm:ss]"
+  task_id: !join
+    - *error_prefix
+    - Task IDs must be valid integer numbers.
+  # Expects additional `lower_bound` and `upper_bound` arguments, in that order.
+  ranked_integer: !join
+    - *error_prefix
+    - Must be an integer value from [%s-%s].

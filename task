@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+
+import re
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+
+import yaml
+
+from datetime import datetime, timezone
+from functools import partial
+from hashlib import blake2b
+from pathlib import Path
+from shutil import get_terminal_size
+from typing import Any, Callable, Optional
+
+from clipp import Command, OptionGroup
+from clipp.core import get_indent, Subcommand
+
+# todo: implement compression for long posts
+
+tempfile.tempdir = "/tmp"
+tmpfile = tempfile.NamedTemporaryFile(prefix="tasker_")
+tmpfile_path = Path(tmpfile.name)
+
+confdir = Path("~/.config/tasker").expanduser()
+datadir = Path("~/.local/share/tasker").expanduser()
+
+DB = "tasker.sqlite"
+cnx = sqlite3.connect(datadir / DB)
+
+fill_text = partial(
+    textwrap.fill,
+    break_on_hyphens=False,
+    replace_whitespace=False,
+)
+
+
+def yaml_join_handler(loader, node):
+    seq = loader.construct_sequence(node)
+    return "".join([str(v) for v in seq])
+
+
+yaml.add_constructor("!join", yaml_join_handler)
+config = yaml.load(
+    (confdir / ".interface.yaml").read_bytes(), Loader=yaml.Loader
+)
+help_messages = config["help_messages"]
+
+
+def fill_paragraph(
+        text: str,
+        initial_indent: str = "",
+        subsequent_indent: str = "",
+        ):
+    """Multi-line text fill which retains leading indentation for each line."""
+    width = get_terminal_size().columns
+    chunks = text.split("\n")
+    # When filling the first line, the specified initial and subsequent
+    # indents need to be honored.
+    para = fill_text(
+        chunks[0],
+        width=width,
+        initial_indent=initial_indent,
+        subsequent_indent=subsequent_indent,
+        drop_whitespace=True,
+    )
+    lines = para.split("\n")
+    # If the first line contains only whitespace, remove it.
+    i = 1 if lines[0].lstrip() == "" else 0
+    chunks[0] = "\n".join(lines[i:])
+    # Dropping whitespace here would remove indentation we wish to retain.
+    paragraphs = (
+        fill_text(ln, width=width, drop_whitespace=False)
+        for ln in chunks[1:] # We've already formatted the first chunk.
+    )
+    for i, para in enumerate(paragraphs, start=1):
+        # The initial indent and subsequent indent must match the leading
+        # indent of the paragraph but also honor the subseqeunt indent which
+        # was supplied as an argument.
+        indent = get_indent(para) + subsequent_indent
+        # We can now allow leading and trailing whitespace to be dropped.
+        chunks[i] = fill_text(
+            para.lstrip(),
+            width=width,
+            initial_indent=indent,
+            subsequent_indent=indent,
+            drop_whitespace=True,
+        )
+
+    return "\n".join(chunks)
+
+
+def live_edit(filename: str, offset: int = 0) -> None:
+    """
+    Open the file ``filename`` in vim and set the cursor at the specified
+    offset.
+    """
+    vim_args = ("vim", filename, "-u", str(confdir / "vimrc"), f"+{offset}")
+    subprocess.call(args=vim_args)
+
+
+def initialize_tasks():
+    """Create the tasks table if it does not already exist."""
+    cnx.execute("""\
+        CREATE TABLE IF NOT EXISTS 'tasks' (
+            'task_id' INTEGER PRIMARY KEY,
+            'ctime' DATETIME DEFAULT CURRENT_TIMESTAMP,
+            'desc' TEXT NOT NULL UNIQUE,
+            'priority' INT NOT NULL,
+            'time_estimate' FLOAT NOT NULL,
+            'difficulty' INT NOT NULL,
+            'progress' FLOAT DEFAULT 0.0,
+            'is_open' BOOL CHECK (is_open IN (0, 1)) DEFAULT 1,
+            'deadline' TIMESTAMP DEFAULT NULL,
+            'rank' GENERATED ALWAYS AS (
+                (LOG2(time_estimate) / LOG2(3) * (difficulty * .20) + priority)
+                * (1 - progress)
+                ) STORED,
+            'past_due' BOOL CHECK (past_due IN (0, 1)) GENERATED ALWAYS AS (
+                IIF ((deadline - ctime) < 0, 1, 0)
+                ) STORED
+        )"""
+    )
+
+
+def initialize_threads():
+    """Create the threads table if it does not already exist."""
+    cnx.execute("""\
+        CREATE TABLE IF NOT EXISTS 'threads' (
+            'task_id' INTEGER,
+            'post_id' TEXT UNIQUE,
+            'post' TEXT NOT NULL,
+            'ctime' TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY(task_id) REFERENCES tasks(task_id)
+        )"""
+    )
+
+
+def initialize_database() -> None:
+    """Initialize the database if it has not already been initialized."""
+    initialize_tasks()
+    initialize_threads()
+
+
+def open_task(
+        desc: str,
+        priority: int,
+        difficulty: int,
+        time_estimate: float,
+        progress: float = 0.0,
+        deadline: Optional[str] = None,
+        ) -> None:
+    """Open a new task by creating a new task record in the database."""
+    with cnx:
+        cnx.execute("""\
+            INSERT INTO tasks (
+                desc,
+                priority,
+                difficulty,
+                time_estimate,
+                progress,
+                deadline
+            )
+            VALUES(?, ?, ?, ?, ?, ?)""",
+            (desc, priority, difficulty, time_estimate, progress, deadline)
+        )
+
+
+def close_task(task_id: int) -> None:
+    """Manually flag a task as closed."""
+    with cnx:
+        cnx.execute("""\
+            UPDATE tasks
+            SET is_open = 0
+            WHERE task_id = ?""",
+            (task_id, ),
+        )
+
+
+def delete_task(task_id: int) -> None:
+    """
+    Delete the specified task from the database, as well as its corresponding
+    threads.
+    """
+    with cnx:
+        cnx.execute("DELETE FROM tasks WHERE task_id = ?", (task_id, ))
+        cnx.execute("DELETE FROM threads WHERE task_id = ?", (task_id, ))
+
+
+def generate_post_id() -> str:
+    """Generate a unique post ID."""
+    post_hash = blake2b(str(time.time()).encode()).hexdigest()
+    post_id = post_hash[:4] + "-" + post_hash[5:9]
+    return post_id
+
+
+def open_new_thread(task_id: int, post: str) -> None:
+    """Open a new thread for a task."""
+    post_id = generate_post_id(post)
+    while True:
+        try:
+            with cnx:
+                cnx.execute("""\
+                    INSERT INTO threads (
+                        task_id,
+                        post_id,
+                        post
+                    )
+                    VALUES (?, ?, ?)""",
+                    (task_id, post_id, post),
+                )
+        except sqlite3.IntegrityError:
+            post_id = generate_post_id(post_id)
+
+        break
+
+
+def update_post(post_id: str, new_post: str) -> None:
+    """Update a thread post identified by ``post_id``."""
+    with cnx:
+        cnx.execute("""\
+            UPDATE threads 
+            SET column = ?
+            WHERE post_id = ?""",
+            (post_id, ),
+        )
+
+
+def get_post(post_id: str) -> str:
+    """Retrieve a post by its post ID."""
+    cursor = cnx.cursor()
+    with cnx:
+        post = cursor.execute("""\
+            SELECT post FROM threads
+            WHERE post_id = ?""",
+            (post_id, )
+        ).fetchone()[0]
+
+    return post
+
+
+def update_thread(task_id: int, post_id: Optional[str] = None) -> None:
+    """
+    Update a task thread by either creating a new post are updating an existing
+    post.
+    """
+    if post_id is None:
+        # Empty file before writing new post.
+        with tmpfile_path.open("w") as f: pass
+        live_edit(str(tmpfile_path))
+        post = tmpfile_path.read_text()
+        open_new_thread(task_id, post)
+    else:
+        post = get_post(post_id)
+        with tmpfile_path.open("w") as f:
+            f.write(post)
+
+        live_edit(str(tmpfile_path))
+        new_post = tmpfile_path.read_text()
+        update_post(post_id, new_post)
+
+
+def time_in_hours(value: str, option_name: str) -> int:
+    """
+    Convert a time string which can represent weeks, days, hours, or minutes to
+    hours.
+    """
+    if re.match(r"^[0-9]+$", value):
+        t = int(value)
+    elif re.match(r"^[0-9]+[Mm]$", value):
+        t = int(value[:-1]) / 60
+    elif re.match(r"^[0-9]+[Hh]", value):
+        t = int(value[:-1])
+    elif re.match(r"^[0-9]+[Dd]$", value):
+        t = int(value[:-1]) * 24
+    elif re.match(r"^[0-9]+[Ww]$", value):
+        t = int(value[:-1]) * 24 * 7
+    else:
+        err_msg = config["errors"]["time_in_hours"]
+        sys.exit(fill_paragraph(err_msg % (value, option_name)))
+
+
+def to_datetime(value: str, option_name: str) -> datetime:
+    """
+    Convert a string representing a date with optional time part to a `datetime`
+    object.
+    """
+    pattern = re.compile(
+        r"([2-9][0-9]{3}-[0-1][0-9]-[0-3][0-9])"
+        r"(T[0-2][0-9]:[0-6][0-9]:[0-6][0-9])?"
+    )
+    matched = pattern.match(value)
+    if matched:
+        if matched.group(2) is None:
+            value += "T00:00:00"
+
+        try:
+            t = datetime.strptime(value, "%Y-%m-%dT%H:%M:%S").timestamp()
+            t = datetime.fromtimestamp(t, tz=timezone.utc)
+            return t
+        except ValueError:
+            pass
+
+    err_msg = config["errors"]["to_datetime"]
+    sys.exit(fill_paragraph(err_msg % (value, option_name)))
+
+
+def task_id(value: str, option_name: str) -> int:
+    try:
+        value = int(value)
+        return value
+    except ValueError:
+        err_msg = config["errors"]["task_id"]
+        sys.exit(fill_paragraph(err_msg % (value, option_name)))
+
+
+def integer(value: str, option_name: str) -> int:
+    try:
+        value = int(value)
+        return value
+    except ValueError:
+        err_msg = (
+            f"ERROR: value '{value}' supplied to '{option_name}' is not a "
+            f"valid integer number"
+        )
+        sys.exit(err_msg)
+
+
+def ranked_integer(
+        value: str,
+        option_name: str,
+        lower_bound: int,
+        upper_bound: int,
+        ) -> int:
+    value = integer(value, option_name)
+    if not lower_bound < value < upper_bound:
+        err_msg = config["errors"]["ranked_integer"]
+        err_msg = fill_paragraph(
+            err_msg % (value, option_name, lower_bound, upper_bound)
+        )
+        sys.exit(err_msg)
+
+    return value
+
+
+def decimal(value: str, option_name: str) -> float:
+    try:
+        value = float(value)
+        return value
+    except ValueError:
+        err_msg = (
+            f"ERROR: value '{value}' supplied to '{option_name}' is not a "
+            f"valid decimal number"
+        )
+        sys.exit(err_msg)
+
+
+def to_percentage(
+        value: str,
+        option_name: str,
+        lower_bound: int,
+        upper_bound: int,
+        ) -> float:
+    value = ranked_integer(value, option_name, lower_bound, upper_bound)
+    return value / 100
+
+
+def add_open_command(command: Command) -> Subcommand:
+    subcmd = command.add_subcommand("open")
+    subcmd.add_parameter(
+        "priority",
+        dtype=partial(
+            ranked_integer,
+            option_name="priority",
+            lower_bound=1,
+            upper_bound=10,
+        ),
+        help=help_messages["priority"],
+    )
+    subcmd.add_parameter(
+        "difficulty",
+        dtype=partial(
+            ranked_integer,
+            option_name="difficulty",
+            lower_bound=1,
+            upper_bound=10,
+        ),
+        help=help_messages["difficulty"],
+    )
+    subcmd.add_parameter(
+        "time-estimate",
+        dtype=partial(time_in_hours, option_name="time-estimate"),
+        usage="<time-estimate>[modifier]",
+        help=help_messages["time-estimate"],
+    )
+    return subcmd
+
+
+def add_close_command(command: Command) -> Subcommand:
+    subcmd = command.add_subcommand("close")
+    subcmd.add_parameter(
+        "task-id",
+        quota="+",
+        dtype=partial(task_id, option_name="task-id"),
+        help=help_messages["task_id"],
+        dest="ids",
+    )
+    return subcmd
+
+
+def add_drop_command(command: Command) -> Subcommand:
+    subcmd = command.add_subcommand("drop")
+    subcmd.add_parameter(
+        "task-id",
+        quota="+",
+        dtype=partial(task_id, option_name="task-id"),
+        help=help_messages["task_id"],
+        dest="ids",
+    )
+    return subcmd
+
+
+def add_update_command(command: Command) -> Subcommand:
+    subcmd = command.add_subcommand("update")
+    subcmd.add_option(
+        "--priority",
+        dtype=partial(
+            ranked_integer,
+            option_name="priority",
+            lower_bound=0,
+            upper_bound=10,
+        ),
+        help=help_messages["priority"],
+    )
+    subcmd.add_option(
+        "--difficulty",
+        dtype=partial(
+            ranked_integer,
+            option_name="--difficulty",
+            lower_bound=0,
+            upper_bound=10,
+        ),
+        help=help_messages["difficulty"],
+    )
+    subcmd.add_option(
+        "--time-estimate", "-t",
+        dtype=partial(time_in_hours, option_name="--time-estimate"),
+        usage="[--time-estimate=<timestamp>[modifier]]",
+        help=help_messages["time-estimate"],
+    )
+    return subcmd
+
+
+def add_list_command(command: Command) -> Subcommand:
+    subcmd = command.add_subcommand("list")
+    subcmd.add_parameter(
+        "type",
+        choices=["all", "open", "closed"],
+        help=help_messages["type"]
+    )
+    return subcmd
+
+
+def add_thread_command(command: Command) -> Subcommand:
+    subcmd = command.add_subcommand("thread")
+    return subcmd
+
+
+def add_view_command(command: Command) -> Subcommand:
+    subcmd = command.add_subcommand("view")
+    return subcmd
+
+
+def parse_args():
+    help_messages = config["help_messages"]
+    command = Command()
+
+    command.add_binary_flag(
+        "--verbose", "-v",
+        is_global=True,
+        help=help_messages["verbose"],
+    )
+
+    task_group = OptionGroup()
+    task_group.add_option(
+        "--desc", "-d",
+        required=True,
+        help=help_messages["desc"],
+    )
+    task_group.add_option(
+        "--progress",
+        dtype=partial(
+            to_percentage,
+            option_name="desc",
+            lower_bound=0,
+            upper_bound=100,
+        ),
+        default=0,
+        help=help_messages["progress"],
+    )
+    task_group.add_option(
+        "--deadline",
+        usage="[--deadline=<YYYY-MM-DD[Thh:mm:ss]>]",
+        dtype=to_datetime,
+        help=help_messages["deadline"],
+    )
+
+    sort_group = OptionGroup()
+    sort_group.add_binary_flag(
+        "--reverse", "-r",
+        help=help_messages["reverse"],
+    )
+    sort_group.add_option(
+        "--order-by",
+        choices=["rank", "ctime", "deadline"],
+        help=help_messages["order_by"],
+    )
+    sort_group.add_option(
+        "--tail",
+        dtype=partial(integer, option_name="--tail"),
+        const=5,
+        usage="--tail[=<N>]",
+        help=help_messages["tail"],
+    )
+    sort_group.add_option(
+        "--head",
+        dtype=partial(integer, option_name="--head"),
+        const=5,
+        usage="--head[=<N>]",
+        help=help_messages["head"],
+    )
+    sort_group.make_mutually_exclusive("--tail", "--head")
+
+    cmd_open = add_open_command(command)
+    cmd_close = add_close_command(command)
+    cmd_drop = add_drop_command(command)
+    cmd_update = add_update_command(command)
+    cmd_list = add_list_command(command)
+    cmd_thread = add_thread_command(command)
+    cmd_view = add_view_command(command)
+
+    cmd_open.include(task_group)
+    cmd_update.include(task_group, ["--progress", "--deadline"])
+    cmd_list.include(sort_group)
+    return command.parse()
+
+
+if __name__ == "__main__":
+    processed = parse_args()
+    print(processed)
